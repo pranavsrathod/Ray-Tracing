@@ -93,6 +93,10 @@ void plot_pixel_display(int x,int y,unsigned char r,unsigned char g,unsigned cha
 void plot_pixel_jpeg(int x,int y,unsigned char r,unsigned char g,unsigned char b);
 void plot_pixel(int x,int y,unsigned char r,unsigned char g,unsigned char b);
 
+// Forward declarations
+bool intersectSphere(double origin[3], double dir[3], Sphere& s, double& t);
+bool intersectTriangle(double origin[3], double dir[3], Triangle& tri, double& t, double& alpha, double& beta, double& gamma);
+
 
 // Helper: dot product
 double dot(double a[3], double b[3])
@@ -105,6 +109,38 @@ void normalize(double v[3])
 {
   double len = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
   v[0] /= len; v[1] /= len; v[2] /= len;
+}
+
+bool inShadow(double hit[3], double lightPos[3])
+{
+  // Direction from hit point to light
+  double L[3] = {
+    lightPos[0] - hit[0],
+    lightPos[1] - hit[1],
+    lightPos[2] - hit[2]
+  };
+
+  // Distance to light
+  double distToLight = sqrt(L[0]*L[0] + L[1]*L[1] + L[2]*L[2]);
+  normalize(L);
+
+  // Check all spheres
+  for(int i = 0; i < num_spheres; i++)
+  {
+    double t;
+    if(intersectSphere(hit, L, spheres[i], t))
+      if(t < distToLight) return true;
+  }
+
+  // Check all triangles
+  for(int i = 0; i < num_triangles; i++)
+  {
+    double t, alpha, beta, gamma;
+    if(intersectTriangle(hit, L, triangles[i], t, alpha, beta, gamma))
+      if(t < distToLight) return true;
+  }
+
+  return false;
 }
 
 void spherePhong(double hit[3], double dir[3], Sphere& s, double color[3])
@@ -128,6 +164,7 @@ void spherePhong(double hit[3], double dir[3], Sphere& s, double color[3])
   // Sum contributions from each light
   for(int i = 0; i < num_lights; i++)
   {
+    if(inShadow(hit, lights[i].position)) continue;
     // L = direction from hit point to light
     double L[3] = {
       lights[i].position[0] - hit[0],
@@ -184,6 +221,76 @@ bool intersectSphere(double origin[3], double dir[3], Sphere& s, double& t)
   if(t1 > 1e-4) { t = t1; return true; }
   if(t2 > 1e-4) { t = t2; return true; }
   return false;
+}
+
+void trianglePhong(double hit[3], double dir[3], Triangle& tri, double alpha, double beta, double gamma, double color[3])
+{
+  // Interpolate normal using barycentric coords
+  double N[3];
+  for(int c = 0; c < 3; c++)
+    N[c] = alpha * tri.v[0].normal[c]
+         + beta  * tri.v[1].normal[c]
+         + gamma * tri.v[2].normal[c];
+  normalize(N);
+
+  // Interpolate diffuse, specular, shininess
+  double kd[3], ks[3], sh = 0;
+  for(int c = 0; c < 3; c++)
+  {
+    kd[c] = alpha * tri.v[0].color_diffuse[c]
+           + beta  * tri.v[1].color_diffuse[c]
+           + gamma * tri.v[2].color_diffuse[c];
+    ks[c] = alpha * tri.v[0].color_specular[c]
+           + beta  * tri.v[1].color_specular[c]
+           + gamma * tri.v[2].color_specular[c];
+  }
+  sh = alpha * tri.v[0].shininess
+     + beta  * tri.v[1].shininess
+     + gamma * tri.v[2].shininess;
+
+  // View direction
+  double V[3] = {-dir[0], -dir[1], -dir[2]};
+  normalize(V);
+
+  // Ambient
+  color[0] = ambient_light[0] * kd[0];
+  color[1] = ambient_light[1] * kd[1];
+  color[2] = ambient_light[2] * kd[2];
+
+  // Sum contributions from each light
+  for(int i = 0; i < num_lights; i++)
+  {
+    if(inShadow(hit, lights[i].position)) continue;
+
+    double L[3] = {
+      lights[i].position[0] - hit[0],
+      lights[i].position[1] - hit[1],
+      lights[i].position[2] - hit[2]
+    };
+    normalize(L);
+
+    double LdotN = fmax(0.0, dot(L, N));
+    double R[3] = {
+      2.0*LdotN*N[0] - L[0],
+      2.0*LdotN*N[1] - L[1],
+      2.0*LdotN*N[2] - L[2]
+    };
+    normalize(R);
+
+    double RdotV = fmax(0.0, dot(R, V));
+
+    for(int c = 0; c < 3; c++)
+    {
+      color[c] += lights[i].color[c] * (
+        kd[c] * LdotN +
+        ks[c] * pow(RdotV, sh)
+      );
+    }
+  }
+
+  // Clamp
+  for(int c = 0; c < 3; c++)
+    color[c] = fmin(1.0, color[c]);
 }
 
 bool intersectTriangle(double origin[3], double dir[3], Triangle& tri, double& t, double& alpha, double& beta, double& gamma)
@@ -327,16 +434,18 @@ void draw_scene()
       }
       else if(hit_triangle >= 0)
       {
-        // Interpolate diffuse color using barycentric coords
-        Triangle& tri = triangles[hit_triangle];
-        double dc[3];
-        for(int c = 0; c < 3; c++)
-          dc[c] = hit_alpha * tri.v[0].color_diffuse[c]
-                + hit_beta  * tri.v[1].color_diffuse[c]
-                + hit_gamma * tri.v[2].color_diffuse[c];
-        r = (unsigned char)(dc[0] * 255);
-        g = (unsigned char)(dc[1] * 255);
-        b = (unsigned char)(dc[2] * 255);
+        double hit[3] = {
+          origin[0] + closest_t * direction[0],
+          origin[1] + closest_t * direction[1],
+          origin[2] + closest_t * direction[2]
+        };
+
+        double color[3];
+        trianglePhong(hit, direction, triangles[hit_triangle], hit_alpha, hit_beta, hit_gamma, color);
+
+        r = (unsigned char)(color[0] * 255);
+        g = (unsigned char)(color[1] * 255);
+        b = (unsigned char)(color[2] * 255);
       }
       else
       {
