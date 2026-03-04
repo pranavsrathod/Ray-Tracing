@@ -93,6 +93,74 @@ void plot_pixel_display(int x,int y,unsigned char r,unsigned char g,unsigned cha
 void plot_pixel_jpeg(int x,int y,unsigned char r,unsigned char g,unsigned char b);
 void plot_pixel(int x,int y,unsigned char r,unsigned char g,unsigned char b);
 
+
+// Helper: dot product
+double dot(double a[3], double b[3])
+{
+  return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+// Helper: normalize in place
+void normalize(double v[3])
+{
+  double len = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+  v[0] /= len; v[1] /= len; v[2] /= len;
+}
+
+void spherePhong(double hit[3], double dir[3], Sphere& s, double color[3])
+{
+  // Normal at hit point (pointing outward from sphere center)
+  double N[3] = {
+    (hit[0] - s.position[0]) / s.radius,
+    (hit[1] - s.position[1]) / s.radius,
+    (hit[2] - s.position[2]) / s.radius
+  };
+
+  // View direction (from hit point back to camera)
+  double V[3] = {-dir[0], -dir[1], -dir[2]};
+  normalize(V);
+
+  // Start with ambient
+  color[0] = ambient_light[0] * s.color_diffuse[0];
+  color[1] = ambient_light[1] * s.color_diffuse[1];
+  color[2] = ambient_light[2] * s.color_diffuse[2];
+
+  // Sum contributions from each light
+  for(int i = 0; i < num_lights; i++)
+  {
+    // L = direction from hit point to light
+    double L[3] = {
+      lights[i].position[0] - hit[0],
+      lights[i].position[1] - hit[1],
+      lights[i].position[2] - hit[2]
+    };
+    normalize(L);
+
+    // R = reflection of L about N: R = 2(L·N)N - L
+    double LdotN = fmax(0.0, dot(L, N));
+    double R[3] = {
+      2.0*LdotN*N[0] - L[0],
+      2.0*LdotN*N[1] - L[1],
+      2.0*LdotN*N[2] - L[2]
+    };
+    normalize(R);
+
+    double RdotV = fmax(0.0, dot(R, V));
+
+    // Phong equation per channel
+    for(int c = 0; c < 3; c++)
+    {
+      color[c] += lights[i].color[c] * (
+        s.color_diffuse[c]  * LdotN +
+        s.color_specular[c] * pow(RdotV, s.shininess)
+      );
+    }
+  }
+
+  // Clamp to [0, 1]
+  for(int c = 0; c < 3; c++)
+    color[c] = fmin(1.0, color[c]);
+}
 bool intersectSphere(double origin[3], double dir[3], Sphere& s, double& t)
 {
   double oc[3] = {
@@ -243,9 +311,19 @@ void draw_scene()
       unsigned char r, g, b;
       if(hit_sphere >= 0)
       {
-        r = (unsigned char)(spheres[hit_sphere].color_diffuse[0] * 255);
-        g = (unsigned char)(spheres[hit_sphere].color_diffuse[1] * 255);
-        b = (unsigned char)(spheres[hit_sphere].color_diffuse[2] * 255);
+        // Compute hit point
+        double hit[3] = {
+          origin[0] + closest_t * direction[0],
+          origin[1] + closest_t * direction[1],
+          origin[2] + closest_t * direction[2]
+        };
+
+        double color[3];
+        spherePhong(hit, direction, spheres[hit_sphere], color);
+
+        r = (unsigned char)(color[0] * 255);
+        g = (unsigned char)(color[1] * 255);
+        b = (unsigned char)(color[2] * 255);
       }
       else if(hit_triangle >= 0)
       {
