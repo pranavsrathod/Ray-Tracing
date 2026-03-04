@@ -362,103 +362,90 @@ void draw_scene()
     glBegin(GL_POINTS);
     for(unsigned int y=0; y<HEIGHT; y++)
     {
+      const int AA = 2; // 2x2 grid = 4 samples per pixel
+      double colorSum[3] = {0.0, 0.0, 0.0};
 
-      // Convert pixel coords to camera space
-      double nx = (2.0 * (x + 0.5) / WIDTH  - 1.0) * halfWidth;
-      double ny = (2.0 * (y + 0.5) / HEIGHT - 1.0) * halfHeight;
-
-      // Ray origin and direction
-      double origin[3]    = {0.0, 0.0, 0.0};
-      double direction[3] = {nx, ny, -1.0};
-
-      // Normalize direction
-      double len = sqrt(direction[0]*direction[0] + direction[1]*direction[1] + direction[2]*direction[2]);
-      direction[0] /= len;
-      direction[1] /= len;
-      direction[2] /= len;
-
-      // Find closest intersection
-      double closest_t = 1e18;
-      int hit_sphere = -1;
-
-      for(int i = 0; i < num_spheres; i++)
+      for(int si = 0; si < AA; si++)
+      for(int sj = 0; sj < AA; sj++)
       {
-        double t;
-        if(intersectSphere(origin, direction, spheres[i], t))
+        // Offset within pixel for this sample
+        double offsetX = (si + 0.5) / AA;
+        double offsetY = (sj + 0.5) / AA;
+
+        double nx = (2.0 * (x + offsetX) / WIDTH  - 1.0) * halfWidth;
+        double ny = (2.0 * (y + offsetY) / HEIGHT - 1.0) * halfHeight;
+
+        double origin[3]    = {0.0, 0.0, 0.0};
+        double direction[3] = {nx, ny, -1.0};
+
+        double len = sqrt(direction[0]*direction[0] + direction[1]*direction[1] + direction[2]*direction[2]);
+        direction[0] /= len;
+        direction[1] /= len;
+        direction[2] /= len;
+
+        // Find closest intersection
+        double closest_t = 1e18;
+        int hit_sphere = -1;
+
+        for(int i = 0; i < num_spheres; i++)
         {
-          if(t < closest_t)
+          double t;
+          if(intersectSphere(origin, direction, spheres[i], t))
+            if(t < closest_t) { closest_t = t; hit_sphere = i; }
+        }
+
+        int hit_triangle = -1;
+        double hit_alpha, hit_beta, hit_gamma;
+
+        for(int i = 0; i < num_triangles; i++)
+        {
+          double t, alpha, beta, gamma;
+          if(intersectTriangle(origin, direction, triangles[i], t, alpha, beta, gamma))
           {
-            closest_t = t;
-            hit_sphere = i;
+            if(t < closest_t)
+            {
+              closest_t = t;
+              hit_sphere = -1;
+              hit_triangle = i;
+              hit_alpha = alpha;
+              hit_beta = beta;
+              hit_gamma = gamma;
+            }
           }
         }
-      }
 
-      int hit_triangle = -1;
-      double hit_alpha, hit_beta, hit_gamma;
-
-      for(int i = 0; i < num_triangles; i++)
-      {
-        double t, alpha, beta, gamma;
-        if(intersectTriangle(origin, direction, triangles[i], t, alpha, beta, gamma))
+        // Shade
+        double color[3] = {1.0, 1.0, 1.0}; // white background
+        if(hit_sphere >= 0)
         {
-          if(t < closest_t)
-          {
-            closest_t = t;
-            hit_sphere = -1;
-            hit_triangle = i;
-            hit_alpha = alpha;
-            hit_beta = beta;
-            hit_gamma = gamma;
-          }
+          double hit[3] = {
+            origin[0] + closest_t * direction[0],
+            origin[1] + closest_t * direction[1],
+            origin[2] + closest_t * direction[2]
+          };
+          spherePhong(hit, direction, spheres[hit_sphere], color);
         }
+        else if(hit_triangle >= 0)
+        {
+          double hit[3] = {
+            origin[0] + closest_t * direction[0],
+            origin[1] + closest_t * direction[1],
+            origin[2] + closest_t * direction[2]
+          };
+          trianglePhong(hit, direction, triangles[hit_triangle], hit_alpha, hit_beta, hit_gamma, color);
+        }
+
+        colorSum[0] += color[0];
+        colorSum[1] += color[1];
+        colorSum[2] += color[2];
       }
 
-      // Color based on hit
-      unsigned char r, g, b;
-      if(hit_sphere >= 0)
-      {
-        // Compute hit point
-        double hit[3] = {
-          origin[0] + closest_t * direction[0],
-          origin[1] + closest_t * direction[1],
-          origin[2] + closest_t * direction[2]
-        };
-
-        double color[3];
-        spherePhong(hit, direction, spheres[hit_sphere], color);
-
-        r = (unsigned char)(color[0] * 255);
-        g = (unsigned char)(color[1] * 255);
-        b = (unsigned char)(color[2] * 255);
-      }
-      else if(hit_triangle >= 0)
-      {
-        double hit[3] = {
-          origin[0] + closest_t * direction[0],
-          origin[1] + closest_t * direction[1],
-          origin[2] + closest_t * direction[2]
-        };
-
-        double color[3];
-        trianglePhong(hit, direction, triangles[hit_triangle], hit_alpha, hit_beta, hit_gamma, color);
-
-        r = (unsigned char)(color[0] * 255);
-        g = (unsigned char)(color[1] * 255);
-        b = (unsigned char)(color[2] * 255);
-      }
-      else
-      {
-        r = 255; g = 255; b = 255; // white background
-      }
+      // Average samples
+      int numSamples = AA * AA;
+      unsigned char r = (unsigned char)((colorSum[0] / numSamples) * 255);
+      unsigned char g = (unsigned char)((colorSum[1] / numSamples) * 255);
+      unsigned char b = (unsigned char)((colorSum[2] / numSamples) * 255);
       plot_pixel(x, y, r, g, b);
-
-      // // A simple R,G,B output for testing purposes.
-      // // Modify these R,G,B colors to the values computed by your ray tracer.
-      // unsigned char r = x % 256; // modify
-      // unsigned char g = y % 256; // modify
-      // unsigned char b = (x+y) % 256; // modify
-      // plot_pixel(x, y, r, g, b);
     }
     glEnd();
     glFlush();
