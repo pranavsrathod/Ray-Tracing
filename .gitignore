@@ -1,0 +1,13 @@
+# Compiled output
+*.o
+*.a
+hw3
+
+# jpeg build artifacts (keep source, ignore built files)
+external/jpeg-9a-mac/lib/
+external/jpeg-9a-mac/bin/
+external/jpeg-9a-mac/share/
+external/jpeg-9a-mac/include/
+
+# Mac stuff
+.DS_Store
