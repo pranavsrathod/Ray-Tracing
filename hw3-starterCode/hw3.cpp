@@ -348,6 +348,103 @@ bool intersectTriangle(double origin[3], double dir[3], Triangle& tri, double& t
   return true;
 }
 
+void traceRay(double origin[3], double direction[3], double color[3], int depth)
+{
+  // Base case - stop recursing
+  if(depth > 1) { color[0] = color[1] = color[2] = 1.0; return; }
+
+  double closest_t = 1e18;
+  int hit_sphere = -1;
+  int hit_triangle = -1;
+  double hit_alpha, hit_beta, hit_gamma;
+
+  for(int i = 0; i < num_spheres; i++)
+  {
+    double t;
+    if(intersectSphere(origin, direction, spheres[i], t))
+      if(t < closest_t) { closest_t = t; hit_sphere = i; hit_triangle = -1; }
+  }
+
+  for(int i = 0; i < num_triangles; i++)
+  {
+    double t, alpha, beta, gamma;
+    if(intersectTriangle(origin, direction, triangles[i], t, alpha, beta, gamma))
+    {
+      if(t < closest_t)
+      {
+        closest_t = t;
+        hit_sphere = -1;
+        hit_triangle = i;
+        hit_alpha = alpha;
+        hit_beta = beta;
+        hit_gamma = gamma;
+      }
+    }
+  }
+
+  // No hit - background
+  if(hit_sphere < 0 && hit_triangle < 0)
+  {
+    color[0] = color[1] = color[2] = 1.0;
+    return;
+  }
+
+  // Compute hit point
+  double hit[3] = {
+    origin[0] + closest_t * direction[0],
+    origin[1] + closest_t * direction[1],
+    origin[2] + closest_t * direction[2]
+  };
+
+  // Get local Phong color and surface normal
+  double localColor[3];
+  double N[3];
+  double ks[3];
+
+  if(hit_sphere >= 0)
+  {
+    spherePhong(hit, direction, spheres[hit_sphere], localColor);
+    Sphere& s = spheres[hit_sphere];
+    N[0] = (hit[0] - s.position[0]) / s.radius;
+    N[1] = (hit[1] - s.position[1]) / s.radius;
+    N[2] = (hit[2] - s.position[2]) / s.radius;
+    ks[0] = s.color_specular[0];
+    ks[1] = s.color_specular[1];
+    ks[2] = s.color_specular[2];
+  }
+  else
+  {
+    Triangle& tri = triangles[hit_triangle];
+    trianglePhong(hit, direction, tri, hit_alpha, hit_beta, hit_gamma, localColor);
+    // Interpolate normal
+    for(int c = 0; c < 3; c++)
+      N[c] = hit_alpha * tri.v[0].normal[c]
+           + hit_beta  * tri.v[1].normal[c]
+           + hit_gamma * tri.v[2].normal[c];
+    normalize(N);
+    ks[0] = hit_alpha*tri.v[0].color_specular[0] + hit_beta*tri.v[1].color_specular[0] + hit_gamma*tri.v[2].color_specular[0];
+    ks[1] = hit_alpha*tri.v[0].color_specular[1] + hit_beta*tri.v[1].color_specular[1] + hit_gamma*tri.v[2].color_specular[1];
+    ks[2] = hit_alpha*tri.v[0].color_specular[2] + hit_beta*tri.v[1].color_specular[2] + hit_gamma*tri.v[2].color_specular[2];
+  }
+
+  // Compute reflected ray direction: R = d - 2(d·N)N
+  double dDotN = dot(direction, N);
+  double reflDir[3] = {
+    direction[0] - 2.0*dDotN*N[0],
+    direction[1] - 2.0*dDotN*N[1],
+    direction[2] - 2.0*dDotN*N[2]
+  };
+  normalize(reflDir);
+
+  // Recurse
+  double reflColor[3];
+  traceRay(hit, reflDir, reflColor, depth + 1);
+
+  // Blend: finalColor = (1 - ks) * local + ks * reflected
+  for(int c = 0; c < 3; c++)
+    color[c] = fmin(1.0, (1.0 - ks[c]) * localColor[c] + ks[c] * reflColor[c]);
+}
+
 void draw_scene()
 {
   double aspect = (double)WIDTH / (double)HEIGHT;
@@ -377,80 +474,12 @@ void draw_scene()
       direction[1] /= len;
       direction[2] /= len;
 
-      // Find closest intersection
-      double closest_t = 1e18;
-      int hit_sphere = -1;
+      double color[3];
+      traceRay(origin, direction, color, 0);
 
-      for(int i = 0; i < num_spheres; i++)
-      {
-        double t;
-        if(intersectSphere(origin, direction, spheres[i], t))
-        {
-          if(t < closest_t)
-          {
-            closest_t = t;
-            hit_sphere = i;
-          }
-        }
-      }
-
-      int hit_triangle = -1;
-      double hit_alpha, hit_beta, hit_gamma;
-
-      for(int i = 0; i < num_triangles; i++)
-      {
-        double t, alpha, beta, gamma;
-        if(intersectTriangle(origin, direction, triangles[i], t, alpha, beta, gamma))
-        {
-          if(t < closest_t)
-          {
-            closest_t = t;
-            hit_sphere = -1;
-            hit_triangle = i;
-            hit_alpha = alpha;
-            hit_beta = beta;
-            hit_gamma = gamma;
-          }
-        }
-      }
-
-      // Color based on hit
-      unsigned char r, g, b;
-      if(hit_sphere >= 0)
-      {
-        // Compute hit point
-        double hit[3] = {
-          origin[0] + closest_t * direction[0],
-          origin[1] + closest_t * direction[1],
-          origin[2] + closest_t * direction[2]
-        };
-
-        double color[3];
-        spherePhong(hit, direction, spheres[hit_sphere], color);
-
-        r = (unsigned char)(color[0] * 255);
-        g = (unsigned char)(color[1] * 255);
-        b = (unsigned char)(color[2] * 255);
-      }
-      else if(hit_triangle >= 0)
-      {
-        double hit[3] = {
-          origin[0] + closest_t * direction[0],
-          origin[1] + closest_t * direction[1],
-          origin[2] + closest_t * direction[2]
-        };
-
-        double color[3];
-        trianglePhong(hit, direction, triangles[hit_triangle], hit_alpha, hit_beta, hit_gamma, color);
-
-        r = (unsigned char)(color[0] * 255);
-        g = (unsigned char)(color[1] * 255);
-        b = (unsigned char)(color[2] * 255);
-      }
-      else
-      {
-        r = 255; g = 255; b = 255; // white background
-      }
+      unsigned char r = (unsigned char)(color[0] * 255);
+      unsigned char g = (unsigned char)(color[1] * 255);
+      unsigned char b = (unsigned char)(color[2] * 255);
       plot_pixel(x, y, r, g, b);
 
       // // A simple R,G,B output for testing purposes.
