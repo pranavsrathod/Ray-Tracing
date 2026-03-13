@@ -641,7 +641,7 @@ void idle()
     draw_scene();
     if(mode == MODE_JPEG)
       save_jpg();
-      exit(0);
+      // exit(0);
   }
   once=1;
 }
