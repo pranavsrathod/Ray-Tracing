@@ -17,9 +17,15 @@
   #include <GLUT/glut.h>
 #endif
 
+#ifdef _OPENMP
+  #include <omp.h>
+#endif
+
+#include <functional>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 #ifdef WIN32
   #define strcasecmp _stricmp
 #endif
@@ -111,35 +117,89 @@ void normalize(double v[3])
   v[0] /= len; v[1] /= len; v[2] /= len;
 }
 
+// ─── PATH TRACER HELPERS ──────────────────────────────────────────────────
+
+#include <random>
+
+// Random double in [0, 1)
+static std::mt19937 rng(42);
+static std::uniform_real_distribution<double> dist(0.0, 1.0);
+inline double randomDouble() { return dist(rng); }
+
+// Cross product: out = a x b
+void cross(double a[3], double b[3], double out[3])
+{
+  out[0] = a[1]*b[2] - a[2]*b[1];
+  out[1] = a[2]*b[0] - a[0]*b[2];
+  out[2] = a[0]*b[1] - a[1]*b[0];
+}
+
+// Build an orthonormal basis (tangent, bitangent) around a normal N.
+// We need this to transform our sampled hemisphere direction into world space.
+void buildFrame(double N[3], double T[3], double B[3])
+{
+  // Pick an arbitrary vector not parallel to N
+  double up[3] = {0.0, 1.0, 0.0};
+  if(fabs(N[1]) > 0.99) { up[0]=1.0; up[1]=0.0; up[2]=0.0; }
+
+  cross(up, N, T);
+  normalize(T);
+  cross(N, T, B); // B is already unit length since N and T are orthonormal
+}
+
+// Cosine-weighted hemisphere sample in world space around normal N.
+// r1, r2 are uniform random numbers in [0,1).
+// Why cosine-weighted? It importance-samples the cosine term in the
+// rendering equation, so the pdf cancels cleanly: (cosθ/π) / (cosθ/π) = 1
+void sampleHemisphere(double N[3], double out[3])
+{
+  double r1 = randomDouble();
+  double r2 = randomDouble();
+
+  // Spherical coords in local space
+  // cosθ = sqrt(r1) gives cosine-weighted distribution
+  double sinTheta = sqrt(1.0 - r1);  // sin(arccos(sqrt(r1)))
+  double cosTheta = sqrt(r1);
+  double phi = 2.0 * M_PI * r2;
+
+  // Local direction (x,y,z) where y is "up" (along N)
+  double localX = sinTheta * cos(phi);
+  double localY = cosTheta;            // component along N
+  double localZ = sinTheta * sin(phi);
+
+  // Build frame around N and transform to world space
+  double T[3], B[3];
+  buildFrame(N, T, B);
+
+  out[0] = localX*T[0] + localY*N[0] + localZ*B[0];
+  out[1] = localX*T[1] + localY*N[1] + localZ*B[1];
+  out[2] = localX*T[2] + localY*N[2] + localZ*B[2];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 bool inShadow(double hit[3], double lightPos[3])
 {
-  // Direction from hit point to light
   double L[3] = {
     lightPos[0] - hit[0],
     lightPos[1] - hit[1],
     lightPos[2] - hit[2]
   };
-
-  // Distance to light
   double distToLight = sqrt(L[0]*L[0] + L[1]*L[1] + L[2]*L[2]);
   normalize(L);
 
-  // Check all spheres
   for(int i = 0; i < num_spheres; i++)
   {
     double t;
     if(intersectSphere(hit, L, spheres[i], t))
-      if(t < distToLight) return true;
+      if(t > 1e-4 && t < distToLight) return true;  // ← added t > 1e-4
   }
-
-  // Check all triangles
   for(int i = 0; i < num_triangles; i++)
   {
     double t, alpha, beta, gamma;
     if(intersectTriangle(hit, L, triangles[i], t, alpha, beta, gamma))
-      if(t < distToLight) return true;
+      if(t > 1e-4 && t < distToLight) return true;  // ← added t > 1e-4
   }
-
   return false;
 }
 
@@ -348,129 +408,229 @@ bool intersectTriangle(double origin[3], double dir[3], Triangle& tri, double& t
   return true;
 }
 
+// ─── RECURSIVE PATH TRACE ────────────────────────────────────────────────
+
+#define MAX_DEPTH 5
+#define SAMPLES 512   // increase to 256+ for final renders
+
+// Returns the radiance along a ray (origin, dir).
+// depth counts how many bounces we've done so far.
+// Change signature to accept rng as a parameter
+void traceRay(double origin[3], double dir[3], int depth, double color[3],
+  std::function<double()>& randFunc)
+{
+  color[0] = color[1] = color[2] = 0.0;
+
+  // ── 1. Find closest intersection ────────────────────────────────────────
+  double closest_t = 1e18;
+  int hit_sphere   = -1;
+  int hit_triangle = -1;
+  double hit_alpha, hit_beta, hit_gamma;
+
+  for(int i = 0; i < num_spheres; i++)
+  {
+    double t;
+    if(intersectSphere(origin, dir, spheres[i], t) && t < closest_t)
+    {
+      closest_t  = t;
+      hit_sphere = i;
+      hit_triangle = -1;
+    }
+  }
+  for(int i = 0; i < num_triangles; i++)
+  {
+    double t, a, b, g;
+    if(intersectTriangle(origin, dir, triangles[i], t, a, b, g) && t < closest_t)
+    {
+      closest_t    = t;
+      hit_triangle = i;
+      hit_sphere   = -1;
+      hit_alpha = a; hit_beta = b; hit_gamma = g;
+    }
+  }
+
+  // ── 2. No hit → black (or you can return a sky color) ───────────────────
+  if(hit_sphere < 0 && hit_triangle < 0)
+  {
+    color[0] = color[1] = color[2] = 0.0; // black background
+    return;
+  }
+
+  // ── 3. Compute hit point, normal, and albedo ─────────────────────────────
+  double hit[3] = {
+    origin[0] + closest_t*dir[0],
+    origin[1] + closest_t*dir[1],
+    origin[2] + closest_t*dir[2]
+  };
+
+  double N[3];       // surface normal at hit
+  double albedo[3];  // diffuse color at hit
+
+  if(hit_sphere >= 0)
+  {
+    Sphere& s = spheres[hit_sphere];
+    N[0] = (hit[0]-s.position[0])/s.radius;
+    N[1] = (hit[1]-s.position[1])/s.radius;
+    N[2] = (hit[2]-s.position[2])/s.radius;
+    albedo[0] = s.color_diffuse[0];
+    albedo[1] = s.color_diffuse[1];
+    albedo[2] = s.color_diffuse[2];
+  }
+  else
+  {
+    Triangle& tri = triangles[hit_triangle];
+    for(int c = 0; c < 3; c++)
+    {
+      N[c] = hit_alpha*tri.v[0].normal[c]
+           + hit_beta *tri.v[1].normal[c]
+           + hit_gamma*tri.v[2].normal[c];
+      albedo[c] = hit_alpha*tri.v[0].color_diffuse[c]
+                + hit_beta *tri.v[1].color_diffuse[c]
+                + hit_gamma*tri.v[2].color_diffuse[c];
+    }
+    normalize(N);
+  }
+
+  // Flip normal if it's facing away from the incoming ray
+  // (handles back-face hits, e.g. inside a box)
+  if(dot(N, dir) > 0)
+  { N[0]=-N[0]; N[1]=-N[1]; N[2]=-N[2]; }
+
+  // ── 4. Emission — treat point lights as a bonus direct term ──────────────
+  // We keep your existing point lights as direct light sampling (Next Event
+  // Estimation lite) so the scene files you already have still look good.
+  double direct[3] = {0,0,0};
+  for(int i = 0; i < num_lights; i++)
+  {
+    if(inShadow(hit, lights[i].position)) continue;
+
+    double L[3] = {
+      lights[i].position[0]-hit[0],
+      lights[i].position[1]-hit[1],
+      lights[i].position[2]-hit[2]
+    };
+    normalize(L);
+    double LdotN = fmax(0.0, dot(L, N));
+    for(int c = 0; c < 3; c++)
+      direct[c] += lights[i].color[c] * albedo[c] * LdotN;
+  }
+
+  // ── 5. Russian Roulette termination ──────────────────────────────────────
+  // Survival probability based on albedo brightness
+  double survive = fmax(albedo[0], fmax(albedo[1], albedo[2]));
+  survive = fmax(0.1, fmin(survive, 0.95)); // clamp so we always have a chance
+
+  if(depth >= MAX_DEPTH || randFunc() > survive)
+  {
+    // Terminate — return only direct lighting
+    for(int c = 0; c < 3; c++)
+      color[c] = fmin(1.0, direct[c]);
+    return;
+  }
+
+  // ── 6. Sample a random bounce direction ──────────────────────────────────
+  double bounceDir[3];
+  {
+    double r1 = randFunc();
+    double r2 = randFunc();
+    double sinTheta = sqrt(1.0 - r1);
+    double cosTheta = sqrt(r1);
+    double phi = 2.0 * M_PI * r2;
+    double T[3], B[3];
+    buildFrame(N, T, B);
+    bounceDir[0] = sinTheta*cos(phi)*T[0] + cosTheta*N[0] + sinTheta*sin(phi)*B[0];
+    bounceDir[1] = sinTheta*cos(phi)*T[1] + cosTheta*N[1] + sinTheta*sin(phi)*B[1];
+    bounceDir[2] = sinTheta*cos(phi)*T[2] + cosTheta*N[2] + sinTheta*sin(phi)*B[2];
+  }
+
+  // Offset origin slightly along normal to avoid self-intersection
+  double bounceOrigin[3] = {
+    hit[0] + N[0]*1e-4,
+    hit[1] + N[1]*1e-4,
+    hit[2] + N[2]*1e-4
+  };
+
+  // ── 7. Recurse ────────────────────────────────────────────────────────────
+  double indirect[3];
+  traceRay(bounceOrigin, bounceDir, depth+1, indirect, randFunc);
+
+  // ── 8. Combine: direct + indirect * albedo / survive ─────────────────────
+  // The albedo/π * π from cosine-weighted pdf cancel, leaving just albedo.
+  // We divide by survive to compensate for Russian Roulette termination.
+  for(int c = 0; c < 3; c++)
+    color[c] = fmin(1.0, direct[c] + (albedo[c] * indirect[c]) / survive);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 void draw_scene()
 {
-  double aspect = (double)WIDTH / (double)HEIGHT;
+  double aspect     = (double)WIDTH / (double)HEIGHT;
   double halfHeight = tan((fov / 2.0) * M_PI / 180.0);
-  double halfWidth = aspect * halfHeight;
-  
-  for(unsigned int x=0; x<WIDTH; x++)
+  double halfWidth  = aspect * halfHeight;
+
+  for(unsigned int x = 0; x < WIDTH; x++)
   {
-    glPointSize(2.0);  
-    // Do not worry about this usage of OpenGL. This is here just so that we can draw the pixels to the screen,
-    // after their R,G,B colors were determined by the ray tracer.
-    glBegin(GL_POINTS);
-    for(unsigned int y=0; y<HEIGHT; y++)
+    std::mt19937 localRng(42 + x);
+    std::uniform_real_distribution<double> localDist(0.0, 1.0);
+    std::function<double()> randLocal = [&]() { return localDist(localRng); };
+
+    for(unsigned int y = 0; y < HEIGHT; y++)
     {
+      double accum[3] = {0.0, 0.0, 0.0};
 
-      // Convert pixel coords to camera space
-      double nx = (2.0 * (x + 0.5) / WIDTH  - 1.0) * halfWidth;
-      double ny = (2.0 * (y + 0.5) / HEIGHT - 1.0) * halfHeight;
-
-      // Ray origin and direction
-      double origin[3]    = {0.0, 0.0, 0.0};
-      double direction[3] = {nx, ny, -1.0};
-
-      // Normalize direction
-      double len = sqrt(direction[0]*direction[0] + direction[1]*direction[1] + direction[2]*direction[2]);
-      direction[0] /= len;
-      direction[1] /= len;
-      direction[2] /= len;
-
-      // Find closest intersection
-      double closest_t = 1e18;
-      int hit_sphere = -1;
-
-      for(int i = 0; i < num_spheres; i++)
+      for(int s = 0; s < SAMPLES; s++)
       {
-        double t;
-        if(intersectSphere(origin, direction, spheres[i], t))
-        {
-          if(t < closest_t)
-          {
-            closest_t = t;
-            hit_sphere = i;
-          }
-        }
-      }
+        double jx = randLocal();
+        double jy = randLocal();
 
-      int hit_triangle = -1;
-      double hit_alpha, hit_beta, hit_gamma;
+        double nx = (2.0 * (x + jx) / WIDTH  - 1.0) * halfWidth;
+        double ny = (2.0 * (y + jy) / HEIGHT - 1.0) * halfHeight;
 
-      for(int i = 0; i < num_triangles; i++)
-      {
-        double t, alpha, beta, gamma;
-        if(intersectTriangle(origin, direction, triangles[i], t, alpha, beta, gamma))
-        {
-          if(t < closest_t)
-          {
-            closest_t = t;
-            hit_sphere = -1;
-            hit_triangle = i;
-            hit_alpha = alpha;
-            hit_beta = beta;
-            hit_gamma = gamma;
-          }
-        }
-      }
-
-      // Color based on hit
-      unsigned char r, g, b;
-      if(hit_sphere >= 0)
-      {
-        // Compute hit point
-        double hit[3] = {
-          origin[0] + closest_t * direction[0],
-          origin[1] + closest_t * direction[1],
-          origin[2] + closest_t * direction[2]
-        };
+        double origin[3]    = {0.0, 0.0, 0.0};
+        double direction[3] = {nx, ny, -1.0};
+        normalize(direction);
 
         double color[3];
-        spherePhong(hit, direction, spheres[hit_sphere], color);
+        traceRay(origin, direction, 0, color, randLocal);
 
-        r = (unsigned char)(color[0] * 255);
-        g = (unsigned char)(color[1] * 255);
-        b = (unsigned char)(color[2] * 255);
+        accum[0] += color[0];
+        accum[1] += color[1];
+        accum[2] += color[2];
       }
-      else if(hit_triangle >= 0)
-      {
-        double hit[3] = {
-          origin[0] + closest_t * direction[0],
-          origin[1] + closest_t * direction[1],
-          origin[2] + closest_t * direction[2]
-        };
 
-        double color[3];
-        trianglePhong(hit, direction, triangles[hit_triangle], hit_alpha, hit_beta, hit_gamma, color);
+      unsigned char r = (unsigned char)(fmin(1.0, accum[0]/SAMPLES) * 255);
+      unsigned char g = (unsigned char)(fmin(1.0, accum[1]/SAMPLES) * 255);
+      unsigned char b = (unsigned char)(fmin(1.0, accum[2]/SAMPLES) * 255);
 
-        r = (unsigned char)(color[0] * 255);
-        g = (unsigned char)(color[1] * 255);
-        b = (unsigned char)(color[2] * 255);
-      }
-      else
-      {
-        r = 255; g = 255; b = 255; // white background
-      }
       plot_pixel(x, y, r, g, b);
-
-      // // A simple R,G,B output for testing purposes.
-      // // Modify these R,G,B colors to the values computed by your ray tracer.
-      // unsigned char r = x % 256; // modify
-      // unsigned char g = y % 256; // modify
-      // unsigned char b = (x+y) % 256; // modify
-      // plot_pixel(x, y, r, g, b);
     }
-    glEnd();
-    glFlush();
+
+    printf("Progress: %d / %d\n", x+1, WIDTH);
+    fflush(stdout);
   }
-  printf("Ray tracing completed.\n"); 
+
+  // Draw all pixels to screen after rendering is done
+  glPointSize(2.0);
+  glBegin(GL_POINTS);
+  for(unsigned int x = 0; x < WIDTH; x++)
+    for(unsigned int y = 0; y < HEIGHT; y++)
+    {
+      glColor3f(buffer[y][x][0]/255.0f, buffer[y][x][1]/255.0f, buffer[y][x][2]/255.0f);
+      glVertex2i(x, y);
+    }
+  glEnd();
+  glFlush();
+
+  printf("Path tracing completed.\n");
   fflush(stdout);
 }
 
+
 void plot_pixel_display(int x, int y, unsigned char r, unsigned char g, unsigned char b)
 {
-  glColor3f(((float)r) / 255.0f, ((float)g) / 255.0f, ((float)b) / 255.0f);
-  glVertex2i(x,y);
+  // glColor3f(((float)r) / 255.0f, ((float)g) / 255.0f, ((float)b) / 255.0f);
+  // glVertex2i(x,y);
 }
 
 void plot_pixel_jpeg(int x, int y, unsigned char r, unsigned char g, unsigned char b)
@@ -480,11 +640,17 @@ void plot_pixel_jpeg(int x, int y, unsigned char r, unsigned char g, unsigned ch
   buffer[y][x][2] = b;
 }
 
+// void plot_pixel(int x, int y, unsigned char r, unsigned char g, unsigned char b)
+// {
+//   plot_pixel_display(x,y,r,g,b);
+//   if(mode == MODE_JPEG)
+//     plot_pixel_jpeg(x,y,r,g,b);
+// }
+
 void plot_pixel(int x, int y, unsigned char r, unsigned char g, unsigned char b)
 {
   plot_pixel_display(x,y,r,g,b);
-  if(mode == MODE_JPEG)
-    plot_pixel_jpeg(x,y,r,g,b);
+  plot_pixel_jpeg(x,y,r,g,b); // always write to buffer
 }
 
 void save_jpg()
@@ -641,7 +807,7 @@ void idle()
     draw_scene();
     if(mode == MODE_JPEG)
       save_jpg();
-      // exit(0);
+      exit(0);
   }
   once=1;
 }
